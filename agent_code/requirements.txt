@@ -1,0 +1,7 @@
+langchain
+langchain-openai
+kubernetes
+google-cloud-monitoring
+python-dotenv
+fastapi
+uvicorn

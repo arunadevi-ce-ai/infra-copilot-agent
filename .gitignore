@@ -1,0 +1,26 @@
+# Terraform
+# Include micro-backend connection files if they contain secrets
+.terraform.lock.hcl
+# Local .terraform directories (contains provider binaries and modules)
+Iac/.terraform/*
+# .tfstate files (contains sensitive infrastructure data and secrets)
+iac/*.tfstate    
+iac/*.tfstate.*
+iac/*.tfstate.backup
+# Exclude all .tfvars files (contains sensitive password/keys data)
+Iac/terraform.tfvars
+iac/*.tfvars
+iac/*.tfvars.json
+Iac/terraform.tfvars
+Iac/.env
+
+# Kubernetes
+k8s_manifest/secret.yaml
+
+# Python / agent
+agent_code/.env
+agent_code/__pycache__/
+agent_code/*.pyc
+
+# General
+.vscode/

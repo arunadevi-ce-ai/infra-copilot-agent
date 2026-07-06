@@ -1,0 +1,41 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infra-agent-deployment
+  labels:
+    app: infra-agent-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: infra-agent-app
+  template:
+    metadata:
+      labels:
+        app: infra-agent-app
+    spec:
+      # WORKLOAD IDENTITY LOCATION: Reference the ServiceAccount here
+      serviceAccountName: gcp-k8s-sa
+      containers:
+      - name: infra-agent-container
+        image: asia-southeast1-docker.pkg.dev/project-7fbcd177-353a-4b5e-bd8/infra-copilot-repo/infra-copilot-agent:v2
+        ports:
+        - containerPort: 8000
+        # Injecting all keys from a secret as environment variables automatically
+        envFrom:
+        - secretRef:
+            name: infra-agent-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infra-agent-app-service
+spec:
+  type: ClusterIP  # Change to NodePort or LoadBalancer if external routing is needed
+  selector:
+    app: infra-agent-app
+  ports:
+  - protocol: TCP
+    port: 8000      # The port the service exposes
+    targetPort: 8000  # The containerPort specified in the deployment
