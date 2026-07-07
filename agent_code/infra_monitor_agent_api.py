@@ -18,10 +18,19 @@ Safety design:
     deployments, plus read-only on other workload types. The agent
     cannot do anything outside what's explicitly granted, regardless of
     what the LLM decides to attempt.
+  - AUDIT LOGGING: every proposed action, confirm/reject decision, and
+    execution result is logged as a single-line JSON object to stdout.
+    On GKE, stdout is automatically collected by Cloud Logging — no extra
+    agent or sidecar needed — so these become queryable, filterable audit
+    events without any additional infrastructure.
 """
 
 import os
 import time
+import json
+import logging
+import sys
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # loads OPENAI_API_KEY and GCP_PROJECT_ID from .env — must run first
 from fastapi import FastAPI
@@ -33,12 +42,42 @@ from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent
 import uuid
 
-# In-memory store for pending write actions awaiting confirmation.
-# Key: confirmation_id (string) -> Value: dict describing the action to run.
-# NOTE: this is fine for a learning/demo project. In a real production
-# system, you'd use something persistent (Redis, a database) since this
-# dict is wiped if the pod restarts.
-pending_actions = {}
+# ---------------------------------------------------------------------------
+# STRUCTURED AUDIT LOGGING
+# ---------------------------------------------------------------------------
+# A dedicated logger, separate from Python's default root logger, so audit
+# events are clearly distinguishable from ordinary application logs (e.g.
+# FastAPI/uvicorn startup messages) if you ever filter by logger name.
+#
+# Each event is emitted as ONE JSON object per line (not pretty-printed) —
+# this is the standard format most log aggregators (Cloud Logging, ELK,
+# Datadog, etc.) expect for structured logs, since each line parses cleanly
+# as one independent JSON record.
+audit_logger = logging.getLogger("infra_copilot.audit")
+audit_logger.setLevel(logging.INFO)
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(logging.Formatter("%(message)s"))  # message IS the JSON — no extra prefix
+audit_logger.addHandler(_handler)
+audit_logger.propagate = False  # avoid double-logging via the root logger
+
+
+def audit_log(event: str, **fields) -> None:
+    """
+    Emit one structured audit event as a JSON line to stdout.
+
+    event: a short, consistent event name, e.g. "action_proposed",
+           "action_confirmed", "action_rejected", "action_executed",
+           "action_failed", "question_asked".
+    fields: any additional structured data relevant to this event
+            (confirmation_id, action type, namespace, pod name, etc.)
+    """
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        **fields,
+    }
+    audit_logger.info(json.dumps(record))
+
 
 # --- Setup: Kubernetes clients ---
 # load_kube_config() reuses the same credentials your `kubectl` command uses
@@ -60,18 +99,22 @@ apps_v1 = client.AppsV1Api()
 batch_v1 = client.BatchV1Api()
 
 # --- Setup: Cloud Monitoring client ---
-# Also reuses local gcloud credentials for now. Once this agent is
-# containerized and deployed INTO the cluster (Phase 4), it will instead
-# authenticate via the Workload Identity binding — no code changes needed,
-# since the client library automatically picks up whichever credentials
-# are available in its environment.
 monitoring_client = monitoring_v3.MetricServiceClient()
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
+
+# In-memory store for pending write actions awaiting confirmation.
+# Key: confirmation_id (string) -> Value: dict describing the action to run.
+# NOTE: this is fine for a learning/demo project. In a real production
+# system, you'd use something persistent (Redis, a database) since this
+# dict is wiped if the pod restarts.
+pending_actions = {}
 
 
 # ---------------------------------------------------------------------------
 # READ-ONLY TOOLS — safe to let the agent call automatically, no confirmation
-# needed since they can't change anything.
+# needed since they can't change anything. Not audit-logged individually,
+# since they carry no risk — audit logging is reserved for actions that
+# change cluster state or the decisions around them.
 # ---------------------------------------------------------------------------
 
 @tool
@@ -86,11 +129,8 @@ def get_pod_status(namespace: str = "default") -> str:
     lines = []
     for pod in pods.items:
         name = pod.metadata.name
-        phase = pod.status.phase  # e.g. Running, Pending, Failed
+        phase = pod.status.phase
 
-        # pod.status.phase alone can be misleading (e.g. "Pending" even when
-        # the real issue is ImagePullBackOff), so we also check each
-        # container's specific waiting reason for a more accurate diagnosis.
         restarts = 0
         reasons = []
         if pod.status.container_statuses:
@@ -105,6 +145,7 @@ def get_pod_status(namespace: str = "default") -> str:
         lines.append(f"- {name}: {status_detail}, restarts={restarts}")
 
     return "\n".join(lines)
+
 
 @tool
 def get_cpu_usage(namespace: str = "default", minutes: int = 10) -> str:
@@ -159,6 +200,7 @@ def get_memory_usage(namespace: str = "default", minutes: int = 10) -> str:
             lines.append(f"- pod={pod}, container={container}: {mib:.1f} MiB")
     return "\n".join(lines) if lines else f"No memory data found for namespace '{namespace}'."
 
+
 @tool
 def get_workload_status(namespace: str = "default") -> str:
     """Get status of Deployments, StatefulSets, DaemonSets, Jobs, and CronJobs
@@ -181,10 +223,11 @@ def get_workload_status(namespace: str = "default") -> str:
 
 
 # ---------------------------------------------------------------------------
-# WRITE TOOLS — these CHANGE cluster state, so each one prompts for explicit
-# human confirmation before performing the action. This is a deliberate
-# safety guardrail: an LLM should never be allowed to silently modify
-# infrastructure just because it "decided to."
+# WRITE TOOLS — these propose (not execute) a cluster change. Each one is
+# audit-logged the moment it's proposed, BEFORE any human has approved it —
+# this matters because even a proposal the human later rejects is worth
+# having a record of (e.g. "the LLM attempted to delete pod X, but a human
+# rejected it" is itself useful audit information).
 # ---------------------------------------------------------------------------
 
 @tool
@@ -193,46 +236,59 @@ def restart_pod(pod_name: str, namespace: str = "default") -> str:
     if managed by a Deployment). This does NOT execute immediately — it
     returns a confirmation_id that must be approved via the /confirm
     endpoint before the action runs."""
-    
+
     confirmation_id = str(uuid.uuid4())
-    
-    # Store what THIS specific action needs to do when confirmed later.
-    # We store the function reference and its arguments, not the result —
-    # nothing actually happens to the cluster yet.
+
     pending_actions[confirmation_id] = {
         "action": "restart_pod",
         "pod_name": pod_name,
         "namespace": namespace,
     }
-    
+
+    audit_log(
+        "action_proposed",
+        confirmation_id=confirmation_id,
+        action="restart_pod",
+        pod_name=pod_name,
+        namespace=namespace,
+    )
+
     return (
         f"Proposed action: restart pod '{pod_name}' in namespace '{namespace}'. "
         f"Confirmation ID: {confirmation_id}. "
         f"Call /confirm with this ID and approve=true to execute."
     )
+
+
 @tool
 def set_deployment_image(deployment_name: str, container_name: str, new_image: str, namespace: str = "default") -> str:
-    """Propose Updating the container image for a given Kubernetes Deployment.
+    """Propose updating the container image for a given Kubernetes Deployment.
     Use this to fix a bad/misspelled image causing ImagePullBackOff.
-    This does NOT execute immediately — it
-    returns a confirmation_id that must be approved via the /confirm
-    endpoint before the action runs."""
-    
+    This does NOT execute immediately — it returns a confirmation_id that
+    must be approved via the /confirm endpoint before the action runs."""
+
     confirmation_id = str(uuid.uuid4())
-    
-    # Store what THIS specific action needs to do when confirmed later.
-    # We store the function reference and its arguments, not the result —
-    # nothing actually happens to the cluster yet.
+
     pending_actions[confirmation_id] = {
         "action": "set_deployment_image",
         "deployment_name": deployment_name,
         "container_name": container_name,
         "new_image": new_image,
-        "namespace": namespace
+        "namespace": namespace,
     }
-    
+
+    audit_log(
+        "action_proposed",
+        confirmation_id=confirmation_id,
+        action="set_deployment_image",
+        deployment_name=deployment_name,
+        container_name=container_name,
+        new_image=new_image,
+        namespace=namespace,
+    )
+
     return (
-        f"Proposed action: set_deployment_image '{deployment_name}' '{container_name}'in namespace '{namespace}' with new image '{new_image}'. "
+        f"Proposed action: set_deployment_image '{deployment_name}' '{container_name}' in namespace '{namespace}' with new image '{new_image}'. "
         f"Confirmation ID: {confirmation_id}. "
         f"Call /confirm with this ID and approve=true to execute."
     )
@@ -240,45 +296,64 @@ def set_deployment_image(deployment_name: str, container_name: str, new_image: s
 
 @tool
 def set_pod_image(pod_name: str, container_name: str, new_image: str, namespace: str = "default") -> str:
-    """Propose Updating the container image for standalone pods — pods.
+    """Propose updating the container image for a standalone pod.
     Use this to fix a bad/misspelled image causing ImagePullBackOff.
-    Note: this only works cleanly for standalone pods — pods
-    managed by a Deployment/ReplicaSet will usually be reverted by their
-    controller, so prefer set_deployment_image for managed pods. 
-    This does NOT execute immediately — it returns a confirmation_id 
-    that must be approved via the /confirm endpoint before the action runs."""
-    
+    Note: this only works cleanly for standalone pods — pods managed by a
+    Deployment/ReplicaSet will usually be reverted by their controller, so
+    prefer set_deployment_image for managed pods. This does NOT execute
+    immediately — it returns a confirmation_id that must be approved via
+    the /confirm endpoint before the action runs."""
+
     confirmation_id = str(uuid.uuid4())
-    
-    # Store what THIS specific action needs to do when confirmed later.
-    # We store the function reference and its arguments, not the result —
-    # nothing actually happens to the cluster yet.
+
     pending_actions[confirmation_id] = {
         "action": "set_pod_image",
         "pod_name": pod_name,
         "container_name": container_name,
         "new_image": new_image,
-        "namespace": namespace
+        "namespace": namespace,
     }
-    
+
+    audit_log(
+        "action_proposed",
+        confirmation_id=confirmation_id,
+        action="set_pod_image",
+        pod_name=pod_name,
+        container_name=container_name,
+        new_image=new_image,
+        namespace=namespace,
+    )
+
     return (
-        f"Proposed action: set_pod_image '{pod_name}' '{container_name}'in namespace '{namespace}' with new image '{new_image}'. "
+        f"Proposed action: set_pod_image '{pod_name}' '{container_name}' in namespace '{namespace}' with new image '{new_image}'. "
         f"Confirmation ID: {confirmation_id}. "
         f"Call /confirm with this ID and approve=true to execute."
     )
 
+
 def execute_action(action: dict) -> str:
     """Actually performs a previously-proposed write action. Called only
-    from the /confirm endpoint, only after explicit human approval."""
-    
-    if action["action"] == "restart_pod":
+    from the /confirm endpoint, only after explicit human approval.
+
+    Every outcome — success or failure — is audit-logged, including the
+    specific Kubernetes API error reason on failure, so a failed remediation
+    attempt is just as visible in the audit trail as a successful one."""
+
+    action_type = action["action"]
+
+    if action_type == "restart_pod":
         try:
             v1.delete_namespaced_pod(name=action["pod_name"], namespace=action["namespace"])
-            return f"Pod '{action['pod_name']}' deleted — Kubernetes will recreate it if managed by a Deployment."
+            result = f"Pod '{action['pod_name']}' deleted — Kubernetes will recreate it if managed by a Deployment."
+            audit_log("action_executed", action=action_type, pod_name=action["pod_name"],
+                       namespace=action["namespace"], success=True)
+            return result
         except client.exceptions.ApiException as e:
+            audit_log("action_failed", action=action_type, pod_name=action["pod_name"],
+                       namespace=action["namespace"], success=False, error=e.reason)
             return f"Failed to restart pod: {e.reason}"
 
-    elif action["action"] == "set_deployment_image":
+    elif action_type == "set_deployment_image":
         try:
             patch = {"spec": {"template": {"spec": {"containers": [
                 {"name": action["container_name"], "image": action["new_image"]}
@@ -286,11 +361,16 @@ def execute_action(action: dict) -> str:
             apps_v1.patch_namespaced_deployment(
                 name=action["deployment_name"], namespace=action["namespace"], body=patch
             )
-            return f"Deployment '{action['deployment_name']}' updated to image '{action['new_image']}'."
+            result = f"Deployment '{action['deployment_name']}' updated to image '{action['new_image']}'."
+            audit_log("action_executed", action=action_type, deployment_name=action["deployment_name"],
+                       new_image=action["new_image"], namespace=action["namespace"], success=True)
+            return result
         except client.exceptions.ApiException as e:
+            audit_log("action_failed", action=action_type, deployment_name=action["deployment_name"],
+                       namespace=action["namespace"], success=False, error=e.reason)
             return f"Failed to update deployment: {e.reason}"
 
-    elif action["action"] == "set_pod_image":
+    elif action_type == "set_pod_image":
         try:
             patch = {"spec": {"containers": [
                 {"name": action["container_name"], "image": action["new_image"]}
@@ -298,17 +378,21 @@ def execute_action(action: dict) -> str:
             v1.patch_namespaced_pod(
                 name=action["pod_name"], namespace=action["namespace"], body=patch
             )
-            return f"Pod '{action['pod_name']}' container updated to image '{action['new_image']}'."
+            result = f"Pod '{action['pod_name']}' container updated to image '{action['new_image']}'."
+            audit_log("action_executed", action=action_type, pod_name=action["pod_name"],
+                       new_image=action["new_image"], namespace=action["namespace"], success=True)
+            return result
         except client.exceptions.ApiException as e:
+            audit_log("action_failed", action=action_type, pod_name=action["pod_name"],
+                       namespace=action["namespace"], success=False, error=e.reason)
             return f"Failed to update pod: {e.reason}"
 
+    audit_log("action_failed", action=action_type, success=False, error="Unknown action type")
     return "Unknown action type."
 
 
 # ---------------------------------------------------------------------------
 # Build the agent — combining all read and write tools into one.
-# create_agent() handles the full "plan -> act -> observe -> respond" loop
-# internally, potentially calling multiple tools per question.
 # ---------------------------------------------------------------------------
 llm = ChatOpenAI(model="gpt-5.4-mini")
 
@@ -329,10 +413,10 @@ agent = create_agent(llm, tools)
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Infra Copilot Agent")
 
-# Pydantic models define the expected shape of incoming request bodies.
-# FastAPI uses these to validate requests automatically and generate docs.
+
 class AskRequest(BaseModel):
     question: str
+
 
 class ConfirmRequest(BaseModel):
     confirmation_id: str
@@ -346,6 +430,7 @@ def ask(request: AskRequest):
     needed, the response will include a confirmation_id — no cluster
     change happens until that ID is submitted to /confirm with approve=true.
     """
+    audit_log("question_asked", question=request.question)
     result = agent.invoke({"messages": [{"role": "user", "content": request.question}]})
     answer = result["messages"][-1].content
     return {"answer": answer}
@@ -360,13 +445,15 @@ def confirm(request: ConfirmRequest):
     action = pending_actions.get(request.confirmation_id)
 
     if action is None:
+        audit_log("confirm_unknown_id", confirmation_id=request.confirmation_id)
         return {"error": "Unknown or already-used confirmation_id."}
 
     if not request.approve:
-        # Remove it either way — an unapproved action shouldn't remain
-        # pending forever, and shouldn't be reusable after rejection.
+        audit_log("action_rejected", confirmation_id=request.confirmation_id, action=action.get("action"))
         del pending_actions[request.confirmation_id]
         return {"result": "Action rejected — nothing was changed."}
+
+    audit_log("action_confirmed", confirmation_id=request.confirmation_id, action=action.get("action"))
 
     # Only NOW does the real Kubernetes API call happen.
     result = execute_action(action)
