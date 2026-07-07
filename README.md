@@ -16,7 +16,7 @@ For read-only questions, it answers immediately using live cluster data. For any
 
 ## Demo
 
-![Infra Copilot asking a question and approving a fix](assets\Infra_copilot Agent_demo.gif)
+![Infra Copilot asking a question and approving a fix](assets/Infra_copilot Agent_demo.gif)
 
 *Asking the agent to check pod health, then confirming a proposed image fix via `/confirm`.*
 
