@@ -190,4 +190,4 @@ terraform destroy -auto-approve -var-file=terraform.tfvars
 
 ## About me
 
-Cloud/DevOps engineer (AWS, GCP, Terraform, Kubernetes) building AI agents that integrate directly with cloud infrastructure. [Add your LinkedIn / portfolio link here]
+Cloud/DevOps engineer (AWS, GCP, Terraform, Kubernetes) building AI agents that integrate directly with cloud infrastructure. 
