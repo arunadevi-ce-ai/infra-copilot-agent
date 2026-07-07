@@ -93,5 +93,4 @@ jobs:
             --base main \
             --head "$BRANCH" \
             --title "ci: update agent image to ${{ github.sha }}" \
-            --body "Automated image tag bump from the build-and-push workflow. Merging this will trigger sync-manifest-to-cluster.yml." \
-            --label "automated"
+            --body "Automated image tag bump from the build-and-push workflow. Merging this will trigger sync-manifest-to-cluster.yml." 
