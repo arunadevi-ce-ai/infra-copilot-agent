@@ -1,0 +1,97 @@
+name: Build and push agent image
+
+# Development happens on `dev` (or feature branches) and goes through a
+# PR for review. This workflow itself only runs AFTER a PR is merged into
+# `main` and that merge touched agent_code/ — nothing runs automatically
+# on `dev` pushes. This keeps "build + push a new image" strictly gated
+# behind code review, not triggered by every commit during development.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agent_code/**"
+
+# Needs write access this time, since this workflow opens a PR with the
+# updated YAML rather than just reading code / pushing to Artifact Registry.
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Keyless auth: exchanges GitHub's OIDC token for short-lived GCP
+      # credentials, impersonating the CI service account. No JSON key
+      # is ever stored in GitHub — same underlying principle as the pod's
+      # Workload Identity binding used elsewhere in this project.
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker asia-southeast1-docker.pkg.dev --quiet
+
+      # Tag the image with the commit SHA so every build is traceable back
+      # to an exact commit — much easier to debug "which code is running?"
+      # than reusing a fixed tag like :v1 every time.
+      - name: Build and push image
+        run: |
+          IMAGE="asia-southeast1-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/infra-copilot-repo/infra-copilot-agent:${{ github.sha }}"
+          docker build -t "$IMAGE" ./agent_code
+          docker push "$IMAGE"
+          echo "Pushed: $IMAGE"
+
+      # Rewrite the image line in the Kubernetes manifest to point at the
+      # image we just pushed, so the file in Git always reflects what's
+      # actually meant to be deployed — no manual editing, no drift between
+      # "what's in the repo" and "what was last built."
+      - name: Patch deployment manifest with new image tag
+        run: |
+          IMAGE="asia-southeast1-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/infra-copilot-repo/infra-copilot-agent:${{ github.sha }}"
+          sed -i "s|image: asia-southeast1-docker.pkg.dev/.*/infra-copilot-agent:.*|image: ${IMAGE}|" k8s_manifest/infra_copilot_deployment.yaml
+          cat k8s_manifest/infra_copilot_deployment.yaml | grep "image:"
+
+      # Instead of committing straight to main (which branch protection
+      # would likely block, and which would bypass review entirely for an
+      # automated change), the bot pushes to its own short-lived branch and
+      # opens a PR. This keeps EVERY change to main — human or automated —
+      # going through the same review gate. Merging this PR is what
+      # actually triggers sync-manifest-to-cluster.yml.
+      - name: Open PR with updated manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="ci/update-image-${{ github.sha }}"
+          git checkout -b "$BRANCH"
+          git add k8s_manifest/infra_copilot_deployment.yaml
+
+          # If the image tag didn't actually change (e.g. a re-run), skip
+          # opening a PR entirely rather than creating an empty one.
+          if git diff --cached --quiet; then
+            echo "No manifest changes — skipping PR."
+            exit 0
+          fi
+
+          git commit -m "ci: update agent image to ${{ github.sha }}"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "ci: update agent image to ${{ github.sha }}" \
+            --body "Automated image tag bump from the build-and-push workflow. Merging this will trigger sync-manifest-to-cluster.yml." \
+            --label "automated"

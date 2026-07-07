@@ -4,5 +4,4 @@ echo ""
 echo "--- Building and pushing Docker image ---"
 # Fill in real Project Id and Repo name
 docker build -t asia-southeast1-docker.pkg.dev/<PROJECT_ID>/infra-copilot-repo/infra-copilot-agent:v1 .
-
 docker push asia-southeast1-docker.pkg.dev/<PROJECT_ID>/infra-copilot-repo/infra-copilot-agent:v1
