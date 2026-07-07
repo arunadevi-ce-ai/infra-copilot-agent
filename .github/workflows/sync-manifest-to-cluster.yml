@@ -32,14 +32,16 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      # This assumes the cluster is already up (provisioned separately via
-      # the manual deploy.yml/Terraform workflow). If the cluster doesn't
-      # exist yet, this step fails clearly rather than silently — a good
-      # signal that the cluster needs to be brought up first.
+      # Using the dedicated action instead of raw `gcloud container clusters
+      # get-credentials` — the plain gcloud command generates a kubeconfig
+      # that relies on gke-gcloud-auth-plugin, which isn't preinstalled on
+      # GitHub-hosted runners. This action handles that automatically.
       - name: Get GKE credentials
-        run: |
-          gcloud container clusters get-credentials my-gke-autopilot-cluster \
-            --region asia-southeast1 --project ${{ vars.GCP_PROJECT_ID }}
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: my-gke-autopilot-cluster
+          location: asia-southeast1
+          project_id: ${{ vars.GCP_PROJECT_ID }}
 
       # Applies whatever is currently committed in k8s_manifest/ — since
       # build-and-push.yml already patched the image tag in this file on
