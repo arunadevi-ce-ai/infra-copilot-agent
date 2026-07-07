@@ -13,6 +13,7 @@ iac/*.tfvars
 iac/*.tfvars.json
 Iac/terraform.tfvars
 Iac/.env
+Iac/deploy.sh
 
 # Kubernetes
 k8s_manifest/secret.yaml
@@ -21,6 +22,7 @@ k8s_manifest/secret.yaml
 agent_code/.env
 agent_code/__pycache__/
 agent_code/*.pyc
+agent_code/build_script.sh
 
 # General
 .vscode/

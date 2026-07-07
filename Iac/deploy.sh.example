@@ -1,0 +1,49 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# deploy.sh — Infra Copilot Agent: deploy script (infra + k8s only)
+# -----------------------------------------------------------------------------
+# Chains:
+#   1. Terraform  -> provisions/updates GKE cluster, Workload Identity, RBAC
+#   2. kubectl    -> applies secret + deployment/service manifests
+#
+# NOTE: this script does NOT build/push a new Docker image — it assumes the
+# image for $IMAGE_TAG already exists in Artifact Registry. Use this when
+# redeploying infra/manifest changes without a code change. For a new image,
+# build and push first, or extend this script with a Docker step.
+# -----------------------------------------------------------------------------
+set -e
+CLUSTER_NAME= #Fill in values
+PROJECT_ID= #Fill in values
+REGION= #Fill in values
+IMAGE_TAG= #Fill in values
+
+REPO_NAME="infra-copilot-repo"
+IMAGE_NAME="infra-copilot-agent"
+FULL_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+echo "=================================================="
+echo " Deploying Infra Copilot Agent"
+echo " Project: $PROJECT_ID | Region: $REGION | Tag: $IMAGE_TAG"
+echo "=================================================="
+
+# --- Step 1: Terraform — provision/update infrastructure -----------------
+echo ""
+echo "--- [1/2] Applying Terraform (cluster, Workload Identity, RBAC) ---"
+terraform init -input=false
+terraform apply -auto-approve -var-file=terraform.tfvars
+
+# --- Step 2: kubectl — deploy the new image to the cluster -----------------
+echo ""
+echo "--- [2/2] Deploying to Kubernetes ---"
+gcloud container clusters get-credentials $CLUSTER_NAME --region "$REGION" --project "$PROJECT_ID"
+kubectl apply -f ../k8s_manifest/secret.yaml
+kubectl apply -f ../k8s_manifest/infra_copilot_deployment.yaml
+kubectl rollout status deployment/infra-agent-deployment
+
+echo ""
+echo "=================================================="
+echo " Deploy complete: $FULL_IMAGE"
+echo " Run 'kubectl get pods' to verify, or"
+echo " 'kubectl port-forward service/infra-agent-app-service 8000:8000' to test"
+echo "=================================================="
+# kubectl port-forward service/infra-agent-app-service 8000:8000
