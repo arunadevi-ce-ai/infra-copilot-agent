@@ -1,5 +1,8 @@
 # Infra Copilot — AI Agent for GKE Monitoring & Remediation
 
+![Build and push](https://github.com/arunadevi-ce-ai/infra-copilot-agent/actions/workflows/build-and-push.yml/badge.svg)
+![Sync manifest](https://github.com/arunadevi-ce-ai/infra-copilot-agent/actions/workflows/sync-manifest-to-cluster.yml/badge.svg)
+
 An AI agent that monitors and can remediate issues in a live Google Kubernetes Engine (GKE) Autopilot cluster — checking pod health and resource usage, and fixing bad container images — deployed as a containerized API running **inside the same cluster it manages**. Built as an end-to-end learning project combining Infrastructure as Code, Kubernetes, and LLM-based tool-calling agents.
 
 ## What it does
@@ -10,6 +13,12 @@ Ask it questions in plain English, via HTTP:
 - *"The broken-app deployment has a bad image, fix it to use nginx"*
 
 For read-only questions, it answers immediately using live cluster data. For anything that would **change** the cluster (restarting a pod, patching an image), it proposes the action and waits for explicit human confirmation via a second API call before anything actually runs.
+
+## Demo
+
+![Infra Copilot asking a question and approving a fix](assets\Infra_copilot Agent_demo.gif)
+
+*Asking the agent to check pod health, then confirming a proposed image fix via `/confirm`.*
 
 ## Architecture
 
@@ -123,6 +132,69 @@ infra-copilot-agent/
 - An OpenAI API key
 - Authenticated locally: `gcloud auth login` and `gcloud auth application-default login`
 
+## CI/CD pipeline
+
+Two GitHub Actions workflows, authenticated to GCP via **Workload Identity Federation** (no downloaded JSON key stored in GitHub — the same keyless-auth principle used for the agent pod itself, applied here to the CI pipeline):
+
+```
+1. Developer pushes code to `dev`, opens PR to `main`
+        │
+        ▼
+2. PR reviewed and merged into `main` (touches agent_code/**)
+        │
+        ▼
+3. build-and-push.yml fires:
+   - builds + pushes image tagged with the commit SHA
+   - patches k8s_manifest/infra_copilot_deployment.yaml with the new tag
+   - opens a SEPARATE auto-generated PR with that change (does not commit
+     directly to main — see "Why an auto-generated PR" below)
+        │
+        ▼
+4. Auto-generated PR reviewed and merged into `main`
+        │
+        ▼
+5. sync-manifest-to-cluster.yml fires (triggered by the k8s_manifest/** change)
+   - authenticates via Workload Identity Federation
+   - applies the manifest to the live GKE cluster
+   - the running Deployment now uses the new image
+```
+
+A manifest-only change (edited directly, not via a code PR) skips straight to step 4 — merging it into `main` triggers `sync-manifest-to-cluster.yml` directly, since `build-and-push.yml`'s path filter (`agent_code/**`) won't match.
+
+**Why an auto-generated PR instead of a direct commit:** `main` is protected and requires review. A bot committing straight to `main` would either be blocked by that protection or would silently bypass review for an automated change. Instead, the bot pushes to its own short-lived branch (`ci/update-image-<sha>`) and opens a PR — every change that reaches `main`, human or automated, goes through the identical review gate.
+
+**Debugging notes from setting this up:**
+- `gh pr create --label` fails if the label doesn't already exist in the repo — labels must be created first, or the flag dropped.
+- GitHub-hosted runners don't have `gke-gcloud-auth-plugin` preinstalled, so raw `gcloud container clusters get-credentials` generates a kubeconfig that `kubectl` can't actually use. Fixed by using the `google-github-actions/get-gke-credentials` action instead, which handles this automatically.
+- `gh run rerun` replays a failed run using the workflow file **as it existed at that commit** — it does not pick up subsequent fixes to the workflow itself. Testing a workflow-file fix requires either a new triggering push, or adding a `workflow_dispatch` trigger and using `gh workflow run` instead, which always uses the current file on the target branch.
+
+## Audit logging
+
+Every proposed action, confirm/reject decision, and execution result is emitted as a single-line JSON object to stdout, which GKE's Cloud Logging collects automatically — no extra logging agent or sidecar required.
+
+Example sequence from a real session:
+```json
+{"timestamp": "...", "event": "question_asked", "question": "broken-pod is unhealthy, set image to nginx:latest"}
+{"timestamp": "...", "event": "action_proposed", "confirmation_id": "e7160b76-...", "action": "set_pod_image", "pod_name": "broken-pod", "new_image": "nginx:latest", "namespace": "default"}
+{"timestamp": "...", "event": "action_confirmed", "confirmation_id": "e7160b76-...", "action": "set_pod_image"}
+{"timestamp": "...", "event": "action_executed", "action": "set_pod_image", "pod_name": "broken-pod", "new_image": "nginx:latest", "namespace": "default", "success": true}
+```
+
+Events logged: `question_asked`, `action_proposed`, `action_confirmed`, `action_rejected`, `action_executed` (with `success: true`), `action_failed` (with `success: false` and the underlying Kubernetes API error reason), and `confirm_unknown_id` (an invalid or already-used confirmation ID).
+
+View live: `kubectl logs -l app=infra-agent-app --tail=50`, or query in **Cloud Logging** with a filter such as `jsonPayload.event="action_executed"`.
+
+**To audit one specific action end-to-end**, filter by its `confirmation_id` (returned in the `/ask` response and visible in the `action_proposed` log line) to pull the full propose → confirm → execute sequence for that single change:
+```
+resource.type="k8s_container"
+resource.labels.container_name="infra-agent-container"
+jsonPayload.confirmation_id="e7160b76-63d5-4a53-874e-71ea0bea7289"
+```
+or via `gcloud`:
+```bash
+gcloud logging read 'jsonPayload.confirmation_id="e7160b76-63d5-4a53-874e-71ea0bea7289"' --format json
+```
+
 ## Setup
 
 **1. Clone and configure**
@@ -186,10 +258,10 @@ terraform destroy -auto-approve -var-file=terraform.tfvars
 
 ## Possible next steps
 
+- [x] Structured audit logging of every proposed and executed action
+- [x] CI/CD pipeline (GitHub Actions) to automate build + deploy
 - [ ] Move `pending_actions` to Redis for multi-replica support
 - [ ] Add API-key or IAP authentication before any external exposure
-- [ ] CI/CD pipeline (GitHub Actions) to automate build + deploy
-- [ ] Structured audit logging of every proposed and executed action
 - [ ] Slack integration so confirmations happen where the team already works
 
 ## About me
