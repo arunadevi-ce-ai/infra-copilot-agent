@@ -67,9 +67,8 @@ infra-copilot-agent/
 │   ├── gke.tf
 │   ├── workload_identity.tf
 │   ├── rbac.tf
-│   ├── terraform.tfvars.example    # copy to terraform.tfvars and fill in real values
-│   ├── deploy.sh                   # end-to-end deploy (gitignored — has hardcoded project config)
-│   └── deploy.sh.example           # placeholder version, safe to commit
+│   ├── terraform.tfvars.example    # copy to terraform.tfvars and fill in values
+│   └── deploy.sh.example           # copy to deploy.sh and fill in values
 ├── k8s_manifest/                    # Kubernetes manifests
 │   ├── infra_copilot_deployment.yaml
 │   └── secret.yaml.example         # copy to secret.yaml and fill in real values
@@ -77,11 +76,8 @@ infra-copilot-agent/
     ├── infra_monitor_agent_api.py
     ├── requirements.txt
     ├── Dockerfile
-    ├── build_script.sh             # builds and pushes the image to Artifact Registry
-    └── build_script.sh.example     # placeholder version, safe to commit
+    └── build_script.sh.example     # copy to build_script.sh and fill in real values
 ```
-
-**Note:** interview prep notes and command cheat sheets are kept in a separate private repo, since this repo is public.
 
 ## Prerequisites
 
