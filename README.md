@@ -13,34 +13,67 @@ For read-only questions, it answers immediately using live cluster data. For any
 
 ## Architecture
 
-```
-┌───────────────────────────────────────────────────┐
-│  GKE Autopilot Cluster                            │
-│  ┌───────────────────────────────────────────┐    │
-│  │  Infra Copilot Agent (FastAPI, in Docker) │    │
-│  │  - LangChain agent + OpenAI API           │    │
-│  │  - Tools: pod status, CPU/memory, restart,│    │
-│  │    set image (pod & deployment)           │    │
-│  │  - Runs as: gcp-k8s-sa (Workload Identity)│    │
-│  └───────────────────────────────────────────┘    │
-└───────────────────────────────────────────────────┘
-        │                    │
-        ▼                    ▼
-  Kubernetes API      Cloud Monitoring API
-  (pod status,        (CPU/memory metrics)
-   patch/delete,
-   scoped by RBAC)
-        │
-        ▼
-   IAM (Workload Identity — no static key files)
-   Terraform (provisions cluster, IAM, RBAC)
-```
+![Infra Copilot architecture diagram](assets/architecture_diagram.png)
 
 **Security model:**
 - **Workload Identity** binds the agent's Kubernetes ServiceAccount to a GCP service account — no downloaded JSON key files, no long-lived static credentials.
 - **Least-privilege RBAC** — the agent can `get/list/delete` Pods and `get/list/patch` Deployments only. It deliberately has **no write access** to StatefulSets, Jobs, or CronJobs (higher risk of data/ordering issues if patched or restarted automatically).
 - **Human-in-the-loop confirmation** — every write action goes through a propose → confirm → execute flow (see below), not automatic execution. Confirmation IDs are single-use.
 - **ClusterIP only** — the service is intentionally not exposed externally (no LoadBalancer/NodePort), since the API currently has no authentication and can modify infrastructure. Access is via `kubectl port-forward` only.
+
+## Request flows
+
+**Read-only question** (e.g. "list pods in default namespace") — the agent calls a tool and answers immediately, no confirmation needed:
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as FastAPI /ask
+    participant Agent as LangChain agent
+    participant LLM as OpenAI LLM
+    participant Tool as get_pod_status()
+    participant K8s as Kubernetes API
+
+    U->>API: POST /ask "list pods in default namespace"
+    API->>Agent: agent.invoke(question)
+    Agent->>LLM: question + tool list
+    LLM-->>Agent: call get_pod_status(namespace="default")
+    Agent->>Tool: execute
+    Tool->>K8s: list_namespaced_pod()
+    K8s-->>Tool: live pod data
+    Tool-->>Agent: formatted status string
+    Agent->>LLM: tool result
+    LLM-->>Agent: final natural language answer
+    Agent-->>API: answer
+    API-->>U: JSON { "answer": "..." }
+```
+
+**Write action** (e.g. "fix broken-pod's image") — the agent proposes the action; nothing changes until a separate, explicit confirmation call:
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as FastAPI
+    participant Agent as LangChain agent
+    participant LLM as OpenAI LLM
+    participant Tool as set_pod_image()
+    participant K8s as Kubernetes API
+
+    U->>API: POST /ask "fix broken-pod's image"
+    API->>Agent: agent.invoke(question)
+    Agent->>LLM: question + tool list
+    LLM-->>Agent: call set_pod_image(...)
+    Agent->>Tool: execute (propose only)
+    Tool-->>Agent: confirmation_id + proposal text
+    Agent-->>API: answer (includes confirmation_id)
+    API-->>U: JSON with confirmation_id
+    U->>API: POST /confirm { confirmation_id, approve: true }
+    API->>API: execute_action(pending_actions[id])
+    API->>K8s: patch_namespaced_pod()
+    K8s-->>API: patch result
+    API->>API: delete pending_actions[id]
+    API-->>U: JSON { "result": "Pod updated..." }
+```
 
 ## How the confirmation flow works
 
@@ -161,4 +194,4 @@ terraform destroy -auto-approve -var-file=terraform.tfvars
 
 ## About me
 
-Cloud/DevOps engineer (AWS, GCP, Terraform, Kubernetes) building AI agents that integrate directly with cloud infrastructure. 
+Cloud/DevOps engineer (AWS, GCP, Terraform, Kubernetes) building AI agents that integrate directly with cloud infrastructure. [Add your LinkedIn / portfolio link here]
