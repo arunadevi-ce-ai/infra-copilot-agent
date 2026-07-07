@@ -1,0 +1,64 @@
+name: Deploy infrastructure and agent
+
+# Manual trigger only — this project's cluster is brought up and torn down
+# on demand (not left running 24/7), so an automatic deploy-on-push doesn't
+# fit the workflow. This lets you trigger a full deploy from GitHub's UI
+# whenever you actually want the cluster up.
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (e.g. a commit SHA from a previous build)"
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Terraform init and apply
+        working-directory: Iac
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve \
+            -var="project_id=${{ vars.GCP_PROJECT_ID }}" \
+            -var="region=asia-southeast1"
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: my-gke-autopilot-cluster
+          location: asia-southeast1
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      # Secret is created here from a GitHub secret, NOT committed to the
+      # repo — same principle as the gitignored secret.yaml used locally.
+      - name: Apply Kubernetes secret
+        run: |
+          kubectl create secret generic infra-agent-secret \
+            --from-literal=GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID }} \
+            --from-literal=OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy agent with the specified image tag
+        run: |
+          IMAGE="asia-southeast1-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/infra-copilot-repo/infra-copilot-agent:${{ github.event.inputs.image_tag }}"
+          kubectl apply -f k8s_manifest/infra_copilot_deployment.yaml
+          kubectl set image deployment/infra-agent-deployment web-container="$IMAGE"
+          kubectl rollout status deployment/infra-agent-deployment
