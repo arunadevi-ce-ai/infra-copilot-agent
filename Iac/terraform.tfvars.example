@@ -1,0 +1,7 @@
+project_id = ""
+gcp_region = ""
+gcp_zone = ""
+k8s_namespace = ""
+service_account_name = ""
+project_number = ""
+github_repo=""
