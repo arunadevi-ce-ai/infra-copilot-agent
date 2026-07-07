@@ -10,6 +10,12 @@ on:
     branches: [main]
     paths:
       - "k8s_manifest/**"
+  # Allows manually triggering this workflow from the Actions tab or `gh`
+  # CLI, always using the CURRENT version of this file on the target branch
+  # — unlike `gh run rerun`, which replays an old run using whatever this
+  # file looked like at that commit. Useful for testing fixes to the
+  # workflow itself without needing a real manifest change to trigger it.
+  workflow_dispatch:
 
 permissions:
   contents: read
