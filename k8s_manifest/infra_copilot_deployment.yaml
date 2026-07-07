@@ -19,7 +19,7 @@ spec:
       serviceAccountName: gcp-k8s-sa
       containers:
       - name: infra-agent-container
-        image: asia-southeast1-docker.pkg.dev/project-7fbcd177-353a-4b5e-bd8/infra-copilot-repo/infra-copilot-agent:v2
+        image: asia-southeast1-docker.pkg.dev/project-7fbcd177-353a-4b5e-bd8/infra-copilot-repo/infra-copilot-agent:5f96f3b4b0247b35856ca0ae0358a3a96130ee69
         ports:
         - containerPort: 8000
         # Injecting all keys from a secret as environment variables automatically
