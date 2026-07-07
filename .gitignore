@@ -14,6 +14,7 @@ iac/*.tfvars.json
 Iac/terraform.tfvars
 Iac/.env
 Iac/deploy.sh
+Iac/set_github_var_secrets.sh
 
 # Kubernetes
 k8s_manifest/secret.yaml

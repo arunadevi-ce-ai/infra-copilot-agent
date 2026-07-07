@@ -1,0 +1,51 @@
+name: Sync manifest to cluster
+
+# Triggers when a PR from `dev` is merged into `main` AND that merge
+# actually touched k8s_manifest/ (i.e. build-and-push.yml already bumped
+# the image tag there). This is the step that actually changes what's
+# running in the live cluster — everything before this point (build, PR
+# review) only touched Git and Artifact Registry, not the cluster itself.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "k8s_manifest/**"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  sync-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # This assumes the cluster is already up (provisioned separately via
+      # the manual deploy.yml/Terraform workflow). If the cluster doesn't
+      # exist yet, this step fails clearly rather than silently — a good
+      # signal that the cluster needs to be brought up first.
+      - name: Get GKE credentials
+        run: |
+          gcloud container clusters get-credentials my-gke-autopilot-cluster \
+            --region asia-southeast1 --project ${{ vars.GCP_PROJECT_ID }}
+
+      # Applies whatever is currently committed in k8s_manifest/ — since
+      # build-and-push.yml already patched the image tag in this file on
+      # the dev branch, and that change has now been reviewed and merged,
+      # this simply syncs the cluster to match what's in Git.
+      - name: Apply updated manifest
+        run: |
+          kubectl apply -f k8s_manifest/infra_copilot_deployment.yaml
+          kubectl rollout status deployment/infra-agent-deployment
