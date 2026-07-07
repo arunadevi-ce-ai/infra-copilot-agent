@@ -48,7 +48,6 @@ import uuid
 # A dedicated logger, separate from Python's default root logger, so audit
 # events are clearly distinguishable from ordinary application logs (e.g.
 # FastAPI/uvicorn startup messages) if you ever filter by logger name.
-#
 # Each event is emitted as ONE JSON object per line (not pretty-printed) —
 # this is the standard format most log aggregators (Cloud Logging, ELK,
 # Datadog, etc.) expect for structured logs, since each line parses cleanly
