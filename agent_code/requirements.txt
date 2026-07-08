@@ -5,3 +5,4 @@ google-cloud-monitoring
 python-dotenv
 fastapi
 uvicorn
+redis

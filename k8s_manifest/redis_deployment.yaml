@@ -1,0 +1,65 @@
+# -----------------------------------------------------------------------------
+# redis-deployment.yaml
+# -----------------------------------------------------------------------------
+# A minimal in-cluster Redis instance, used to store pending write-action
+# confirmations (previously an in-memory Python dict in the agent pod).
+# This solves the real problem — sharing pending_actions across multiple
+# agent replicas — without persistent storage, which was considered and
+# deliberately ruled out: pending confirmations are short-lived (1-hour
+# TTL) and low-value if lost, so the cost and zone-pinning tradeoffs of a
+# persistent disk aren't justified for this data. Audit history, which IS
+# worth keeping durably, already lives in Cloud Logging regardless of
+# Redis state.
+#
+# Why Redis instead of Cloud Memorystore:
+#   - Lives and dies with the rest of the cluster (destroyed by
+#     `terraform destroy` along with everything else) — no separate
+#     managed-service cost to track or forget about between sessions.
+#   - For a real production system with durability requirements, Cloud
+#     Memorystore for Redis would be the correct upgrade path.
+#
+# No persistent volume is used — data is intentionally ephemeral. If the
+# Redis pod restarts, any pending (unconfirmed) actions are lost, which is
+# an acceptable tradeoff.
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-deployment
+  labels:
+    app: redis
+spec:
+  replicas: 1   # a single Redis instance is the shared source of truth for all agent replicas
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+spec:
+  type: ClusterIP   # internal only — never exposed outside the cluster
+  selector:
+    app: redis
+  ports:
+  - protocol: TCP
+    port: 6379
+    targetPort: 6379
