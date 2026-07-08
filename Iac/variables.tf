@@ -22,7 +22,3 @@ variable "k8s_namespace"{
     type    = string
     description = "cluster namespace where all the kubernetes objects live"
 }
-variable "github_repo" {
-  description = "Exact 'owner/repo' string for the GitHub repository allowed to use WIF (e.g. yourname/infra-copilot-agent)"
-  type        = string
-}

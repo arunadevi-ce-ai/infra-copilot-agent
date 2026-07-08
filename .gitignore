@@ -3,19 +3,22 @@
 .terraform.lock.hcl
 # Local .terraform directories (contains provider binaries and modules)
 Iac/.terraform/*
+Iac/persistent/.terraform/*
 # .tfstate files (contains sensitive infrastructure data and secrets)
-iac/*.tfstate    
-iac/*.tfstate.*
-iac/*.tfstate.backup
+Iac/*.tfstate    
+Iac/*.tfstate.*
+Iac/*.tfstate.backup
+Iac/persistent/*.tfstate    
+Iac/persistent/*.tfstate.*
+Iac/persistent/*.tfstate.backup
 # Exclude all .tfvars files (contains sensitive password/keys data)
 Iac/terraform.tfvars
-iac/*.tfvars
-iac/*.tfvars.json
-Iac/terraform.tfvars
+Iac/persistent/terraform.tfvars
+Iac/*.tfvars
+Iac/*.tfvars.json
 Iac/.env
 Iac/deploy.sh
 Iac/set_github_var_secrets.sh
-
 # Kubernetes
 k8s_manifest/secret.yaml
 
