@@ -16,18 +16,19 @@ For read-only questions, it answers immediately using live cluster data. For any
 
 ## Demo
 
-![Infra Copilot asking a question and approving a fix](assets\Infra_copilot_agent_demo.gif)
+![Infra Copilot asking a question and approving a fix](assets/Infra_copilot_agent_demo.gif)
 
 *Asking the agent to check pod health, then confirming a proposed image fix via `/confirm`.*
 
 ## Architecture
 
-![Infra Copilot architecture diagram](assets/architecture_diagram.png)
+![Infra Copilot architecture diagram](assets/architecture_diagram_v2.png)
 
 **Security model:**
 - **Workload Identity** binds the agent's Kubernetes ServiceAccount to a GCP service account — no downloaded JSON key files, no long-lived static credentials.
 - **Least-privilege RBAC** — the agent can `get/list/delete` Pods and `get/list/patch` Deployments only. It deliberately has **no write access** to StatefulSets, Jobs, or CronJobs (higher risk of data/ordering issues if patched or restarted automatically).
 - **Human-in-the-loop confirmation** — every write action goes through a propose → confirm → execute flow (see below), not automatic execution. Confirmation IDs are single-use.
+- **Shared, expiring approval store** — pending confirmations live in an in-cluster Redis (ClusterIP only, never exposed), keyed by confirmation ID with a 1-hour TTL. Every agent replica sees the same pending actions, and forgotten proposals expire on their own instead of lingering.
 - **ClusterIP only** — the service is intentionally not exposed externally (no LoadBalancer/NodePort), since the API currently has no authentication and can modify infrastructure. Access is via `kubectl port-forward` only.
 
 ## Request flows
@@ -66,6 +67,7 @@ sequenceDiagram
     participant Agent as LangChain agent
     participant LLM as OpenAI LLM
     participant Tool as set_pod_image()
+    participant R as Redis
     participant K8s as Kubernetes API
 
     U->>API: POST /ask "fix broken-pod's image"
@@ -73,14 +75,17 @@ sequenceDiagram
     Agent->>LLM: question + tool list
     LLM-->>Agent: call set_pod_image(...)
     Agent->>Tool: execute (propose only)
+    Tool->>R: store_pending_action(id) — 1-hour TTL
     Tool-->>Agent: confirmation_id + proposal text
     Agent-->>API: answer (includes confirmation_id)
     API-->>U: JSON with confirmation_id
     U->>API: POST /confirm { confirmation_id, approve: true }
-    API->>API: execute_action(pending_actions[id])
+    API->>R: get_pending_action(id)
+    R-->>API: proposed action
+    API->>API: execute_action(action)
     API->>K8s: patch_namespaced_pod()
     K8s-->>API: patch result
-    API->>API: delete pending_actions[id]
+    API->>R: delete_pending_action(id)
     API-->>U: JSON { "result": "Pod updated..." }
 ```
 
@@ -102,18 +107,29 @@ This exists because a containerized API can't use a blocking terminal prompt (`i
 
 ```
 infra-copilot-agent/
+├── .github/workflows/               # CI/CD (see "CI/CD pipeline" below)
+│   ├── build-and-push.yml
+│   ├── sync-manifest-to-cluster.yml
+│   └── deploy.yml
 ├── Iac/                             # Terraform: cluster, Workload Identity, RBAC
-│   ├── providers.tf
+│   ├── main.tf
 │   ├── variables.tf
-│   ├── apis.tf
 │   ├── gke.tf
+│   ├── iam.tf
 │   ├── workload_identity.tf
 │   ├── rbac.tf
 │   ├── terraform.tfvars.example    # copy to terraform.tfvars and fill in values
-│   └── deploy.sh.example           # copy to deploy.sh and fill in values
+│   ├── deploy.sh.example           # copy to deploy.sh and fill in values
+│   └── persistent/                 # long-lived resources, kept separate from the cluster
+│       ├── main.tf
+│       ├── variables.tf
+│       ├── outputs.tf
+│       └── github_wif.tf           # GitHub Workload Identity Federation (keyless CI auth)
 ├── k8s_manifest/                    # Kubernetes manifests
 │   ├── infra_copilot_deployment.yaml
+│   ├── redis_deployment.yaml       # in-cluster Redis for pending confirmations
 │   └── secret.yaml.example         # copy to secret.yaml and fill in real values
+├── assets/                          # README images and demo GIF
 └── agent_code/                      # Application source
     ├── infra_monitor_agent_api.py
     ├── requirements.txt
@@ -130,7 +146,7 @@ infra-copilot-agent/
 
 ## CI/CD pipeline
 
-Two GitHub Actions workflows, authenticated to GCP via **Workload Identity Federation** (no downloaded JSON key stored in GitHub — the same keyless-auth principle used for the agent pod itself, applied here to the CI pipeline):
+Three GitHub Actions workflows, authenticated to GCP via **Workload Identity Federation** (no downloaded JSON key stored in GitHub — the same keyless-auth principle used for the agent pod itself, applied here to the CI pipeline):
 
 ```
 1. Developer pushes code to `dev`, opens PR to `main`
@@ -156,6 +172,8 @@ Two GitHub Actions workflows, authenticated to GCP via **Workload Identity Feder
 ```
 
 A manifest-only change (edited directly, not via a code PR) skips straight to step 4 — merging it into `main` triggers `sync-manifest-to-cluster.yml` directly, since `build-and-push.yml`'s path filter (`agent_code/**`) won't match.
+
+**Manual full deploy (`deploy.yml`):** the third workflow is `workflow_dispatch` only, triggered from GitHub's UI with an `image_tag` input. Because the cluster is brought up and torn down on demand rather than left running, it runs the whole bring-up in one go: Terraform apply, GKE credentials, the Kubernetes secret (created from a GitHub secret, never committed), then the agent deployment at the chosen image tag.
 
 **Why an auto-generated PR instead of a direct commit:** `main` is protected and requires review. A bot committing straight to `main` would either be blocked by that protection or would silently bypass review for an automated change. Instead, the bot pushes to its own short-lived branch (`ci/update-image-<sha>`) and opens a PR — every change that reaches `main`, human or automated, goes through the identical review gate.
 
@@ -195,7 +213,7 @@ gcloud logging read 'jsonPayload.confirmation_id="e7160b76-63d5-4a53-874e-71ea0b
 
 **1. Clone and configure**
 ```bash
-git clone https://github.com/<your-username>/infra-copilot-agent.git
+git clone https://github.com/arunadevi-ce-ai/infra-copilot-agent.git
 cd infra-copilot-agent
 
 cp Iac/terraform.tfvars.example Iac/terraform.tfvars
@@ -249,14 +267,16 @@ terraform destroy -auto-approve -var-file=terraform.tfvars
 - **In-cluster vs. local Kubernetes config are different code paths.** `config.load_kube_config()` only works with a local kubeconfig file (e.g. on a laptop); inside a pod, there is no such file — `config.load_incluster_config()` reads the automatically-mounted service account token instead. The agent tries in-cluster config first and falls back to local config, so the same script works in both environments.
 - **`input()`-based confirmation cannot work in a containerized HTTP service.** The original CLI version blocked on a terminal prompt before executing a write action. Once containerized behind FastAPI, there's no terminal to prompt — this required redesigning write tools to store a *proposed* action and return a confirmation ID, with actual execution deferred to a separate `/confirm` call.
 - **RBAC scope was a deliberate design decision, not just "grant everything."** Read access covers Deployments, StatefulSets, DaemonSets, Jobs, and CronJobs; write access is intentionally limited to Pods and Deployments only, since automated changes to stateful or batch workloads carry meaningfully higher risk.
-- **Known limitation:** the `pending_actions` store (tracking proposed-but-unconfirmed actions) is in-memory and per-pod. With more than one replica, a `/confirm` call can land on a different pod than the `/ask` call that created it, incorrectly reporting "unknown confirmation_id." Currently mitigated by running a single replica; a production fix would move this state to Redis or a database.
+- **Pending confirmations moved from in-memory to Redis.** The first version kept proposed-but-unconfirmed actions in a Python dict inside the agent pod. With more than one replica, a `/confirm` call could land on a different pod than the `/ask` call that created it, incorrectly reporting "unknown confirmation_id." Pending actions now live in an in-cluster Redis (`store_pending_action` / `get_pending_action` / `delete_pending_action`) with a 1-hour TTL, so every replica reads the same store and forgotten proposals expire on their own. Redis is deliberately ephemeral (no persistent volume): pending confirmations are short-lived and low-value if lost, while the durable audit trail already lives in Cloud Logging.
 - **No authentication on the API itself** — this is why the service is deliberately kept `ClusterIP`-only rather than exposed via LoadBalancer/NodePort. A production version would add API-key or Identity-Aware Proxy authentication before considering external exposure.
 
 ## Possible next steps
 
 - [x] Structured audit logging of every proposed and executed action
 - [x] CI/CD pipeline (GitHub Actions) to automate build + deploy
-- [ ] Move `pending_actions` to Redis for multi-replica support
+- [x] Move `pending_actions` to Redis for multi-replica support
+- [ ] Make `/confirm` atomic (Redis `GETDEL`) so two concurrent confirms can't both execute
+- [ ] Fix `deploy.yml`: set the image on `infra-agent-container` (it currently targets `web-container`) and apply `redis_deployment.yaml` before the agent
 - [ ] Add API-key or IAP authentication before any external exposure
 - [ ] Slack integration so confirmations happen where the team already works
 
