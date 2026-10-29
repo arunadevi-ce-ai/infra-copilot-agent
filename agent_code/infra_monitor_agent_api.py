@@ -3,7 +3,7 @@ Infra Copilot — Kubernetes/GCP Monitoring & Remediation Agent
 ----------------------------------------------------------------
 An LLM agent that can:
   - Read pod health and resource usage from a live GKE cluster
-    (get_pod_status, get_resource_usage, get_workload_status)
+    (get_pod_status, get_cpu_usage, get_memory_usage, get_workload_status)
   - Take corrective WRITE actions on pods/deployments
     (restart_pod, set_deployment_image, set_pod_image)
 
