@@ -22,3 +22,13 @@ variable "k8s_namespace"{
     type    = string
     description = "cluster namespace where all the kubernetes objects live"
 }
+# ----------------------------------finops project varible------------------------------------
+variable "k8s_finops_namespace"{
+    type    = string
+    description = "cluster namespace where all the finops project kubernetes objects live"
+}
+
+variable "k8s_finops_service_account_name"{
+    type    = string
+    description = "name of kubernetes service account in finops namespace"
+}
