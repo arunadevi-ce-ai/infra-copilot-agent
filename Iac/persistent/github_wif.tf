@@ -37,10 +37,13 @@ resource "google_iam_workload_identity_pool_provider" "github_provider" {
     "attribute.repository" = "assertion.repository"
   }
 
-  # CRITICAL: restricts this provider to only accept tokens from this
-  # exact repo. Without this, ANY GitHub repo's Actions workflow could
-  # attempt to impersonate the CI service account.
-  attribute_condition = "assertion.repository == '${var.github_repo}'"
+  # CRITICAL: restricts this provider to only accept tokens from these
+  # exact repos. Without this, ANY GitHub repo's Actions workflow could
+  # attempt to impersonate the CI service account. Extended from a
+  # single equality check to a list membership check so FinOps
+  # Copilot's repo can use the same pool/provider without loosening
+  # this to accept every repo under the account.
+  attribute_condition = "assertion.repository in ['${var.github_repo}', '${var.finops_github_repo}']"
 
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
@@ -73,4 +76,17 @@ resource "google_service_account_iam_member" "ci_wif_binding" {
   service_account_id = google_service_account.github_ci.name
   role                = "roles/iam.workloadIdentityUser"
   member              = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_pool.name}/attribute.repository/${var.github_repo}"
+}
+
+# --- Step 5: Same impersonation grant, extended to FinOps Copilot's repo ---
+# The attribute_condition change above only decides which repos the
+# provider will accept a token from at all — this binding is the
+# separate, required grant of *this specific* repo's principal onto
+# the CI service account. A single google_service_account_iam_member
+# only takes one member, so this is a second resource, not a change to
+# the one above (which stays exactly as Infra Copilot already had it).
+resource "google_service_account_iam_member" "ci_wif_binding_finops" {
+  service_account_id = google_service_account.github_ci.name
+  role                = "roles/iam.workloadIdentityUser"
+  member              = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_pool.name}/attribute.repository/${var.finops_github_repo}"
 }

@@ -16,3 +16,8 @@ variable "github_repo" {
   description = "Exact 'owner/repo' string for the GitHub repository allowed to use WIF (e.g. yourname/infra-copilot-agent)"
   type        = string
 }
+
+variable "finops_github_repo" {
+  description = "Exact 'owner/repo' string for the FinOps Copilot GitHub repository, additionally allowed to use the same WIF pool/provider and CI service account (e.g. yourname/finops-copilot-agent)"
+  type        = string
+}
