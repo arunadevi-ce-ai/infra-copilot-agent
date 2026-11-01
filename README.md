@@ -270,15 +270,28 @@ terraform destroy -auto-approve -var-file=terraform.tfvars
 - **Pending confirmations moved from in-memory to Redis.** The first version kept proposed-but-unconfirmed actions in a Python dict inside the agent pod. With more than one replica, a `/confirm` call could land on a different pod than the `/ask` call that created it, incorrectly reporting "unknown confirmation_id." Pending actions now live in an in-cluster Redis (`store_pending_action` / `get_pending_action` / `delete_pending_action`) with a 1-hour TTL, so every replica reads the same store and forgotten proposals expire on their own. Redis is deliberately ephemeral (no persistent volume): pending confirmations are short-lived and low-value if lost, while the durable audit trail already lives in Cloud Logging.
 - **No authentication on the API itself** — this is why the service is deliberately kept `ClusterIP`-only rather than exposed via LoadBalancer/NodePort. A production version would add API-key or Identity-Aware Proxy authentication before considering external exposure.
 
-## Possible next steps
+## Code walkthrough: write-action flow
 
-- [x] Structured audit logging of every proposed and executed action
-- [x] CI/CD pipeline (GitHub Actions) to automate build + deploy
-- [x] Move `pending_actions` to Redis for multi-replica support
-- [ ] Make `/confirm` atomic (Redis `GETDEL`) so two concurrent confirms can't both execute
-- [ ] Fix `deploy.yml`: set the image on `infra-agent-container` (it currently targets `web-container`) and apply `redis_deployment.yaml` before the agent
-- [ ] Add API-key or IAP authentication before any external exposure
-- [ ] Slack integration so confirmations happen where the team already works
+Where each step of the write-action sequence diagram above happens in [`agent_code/infra_monitor_agent_api.py`](agent_code/infra_monitor_agent_api.py). The three LLM steps have no line of their own — they all run inside the single `agent.invoke(...)` call, which is LangChain's agent loop: send the question + tool list to the model, run the tool it picks, send the result back, repeat until a final answer. Line numbers are as of this commit.
+
+| Phase | Diagram step | Code | Lines |
+|---|---|---|---|
+| Propose | `POST /ask` | `@app.post("/ask")` / `def ask(request: AskRequest):` | [403-404](agent_code/infra_monitor_agent_api.py#L403-L404) |
+| Propose | `agent.invoke(question)` | `result = agent.invoke({"messages": [{"role": "user", "content": request.question}]})` | [411](agent_code/infra_monitor_agent_api.py#L411) |
+| Propose | Question + tool list sent to the LLM | `llm = ChatOpenAI(model="gpt-5.4-mini")` / `agent = create_agent(llm, tools)` | [374](agent_code/infra_monitor_agent_api.py#L374), [386](agent_code/infra_monitor_agent_api.py#L386) |
+| Propose | LLM picks `set_pod_image(...)`, agent runs it | `@tool` / `def set_pod_image(pod_name, container_name, new_image, namespace="default"):` — the docstring is the tool description the model reads | [286-294](agent_code/infra_monitor_agent_api.py#L286-L294) |
+| Propose | Tool stores the proposal in Redis | `confirmation_id = str(uuid.uuid4())` / `store_pending_action(confirmation_id, action)` | [295](agent_code/infra_monitor_agent_api.py#L295), [303](agent_code/infra_monitor_agent_api.py#L303) |
+| Propose | …Redis write with 1-hour TTL | `redis_client.setex(f"pending_action:{confirmation_id}", PENDING_ACTION_TTL_SECONDS, json.dumps(action))` | [99-102](agent_code/infra_monitor_agent_api.py#L99-L102) |
+| Propose | Tool returns confirmation_id + proposal text | `return (f"Proposed action: set_pod_image ... Confirmation ID: {confirmation_id}. "` | [309-310](agent_code/infra_monitor_agent_api.py#L309-L310) |
+| Propose | Answer returned to the user | `answer = result["messages"][-1].content` / `return {"answer": answer}` | [412-413](agent_code/infra_monitor_agent_api.py#L412-L413) |
+| Execute | `POST /confirm` | `@app.post("/confirm")` / `def confirm(request: ConfirmRequest):` | [416-417](agent_code/infra_monitor_agent_api.py#L416-L417) |
+| Execute | `get_pending_action(id)` | `action = get_pending_action(request.confirmation_id)` | [424](agent_code/infra_monitor_agent_api.py#L424) |
+| Execute | …Redis read | `raw = redis_client.get(f"pending_action:{confirmation_id}")` | [109-110](agent_code/infra_monitor_agent_api.py#L109-L110) |
+| Execute | `execute_action(action)` | `result = execute_action(action)` | [437](agent_code/infra_monitor_agent_api.py#L437) |
+| Execute | `patch_namespaced_pod()` | `v1.patch_namespaced_pod(name=action["pod_name"], namespace=action["namespace"], body=patch)` | [355-357](agent_code/infra_monitor_agent_api.py#L355-L357) |
+| Execute | `delete_pending_action(id)` — one-time use | `delete_pending_action(request.confirmation_id)` | [438](agent_code/infra_monitor_agent_api.py#L438) |
+| Execute | …Redis delete | `redis_client.delete(f"pending_action:{confirmation_id}")` | [116](agent_code/infra_monitor_agent_api.py#L116) |
+| Execute | Result returned to the user | `return {"result": result}` | [439](agent_code/infra_monitor_agent_api.py#L439) |
 
 ## About me
 
